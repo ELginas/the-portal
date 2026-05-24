@@ -35,6 +35,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, SanType,
 };
+use reqwest::RequestBuilder;
 use rustls::pki_types::CertificateDer;
 use rustls::{ServerConfig, ServerConnection, Stream};
 use time::{Duration, OffsetDateTime};
@@ -45,6 +46,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
+use tracing::info;
 use tracing::trace;
 use tracing_subscriber::{self, prelude::*};
 use url::Url;
@@ -152,16 +154,20 @@ struct State {
     cert_ca: CertificateDer<'static>,
     issuer: Issuer<'static, KeyPair>,
     domain_configs: HashMap<String, Arc<ServerConfig>>,
+    client: Arc<reqwest::Client>,
 }
 
 impl State {
     pub fn new() -> Self {
         let (cert_ca, issuer) = load_ca();
+        let client = reqwest::Client::builder().http1_only().build().unwrap();
+        let client = Arc::new(client);
 
         Self {
             cert_ca,
             issuer,
             domain_configs: Default::default(),
+            client,
         }
     }
 
@@ -181,6 +187,10 @@ impl State {
     pub fn get_cert<'a>(&self, common_name: &'a str) -> Option<Arc<ServerConfig>> {
         self.domain_configs.get(common_name).map(|v| v.clone())
     }
+
+    pub fn client(&self) -> Arc<reqwest::Client> {
+        self.client.clone()
+    }
 }
 
 async fn tls_stream<IO>(
@@ -195,7 +205,7 @@ where
     let uri = "https://".to_owned() + &uri;
     let url = Url::parse(&uri).unwrap();
 
-    let host = get_url_host(&url).unwrap();
+    let host = get_url_host(&url).unwrap().to_owned();
     let config = {
         let mut state = state.lock().unwrap();
         match state.get_cert(&host) {
@@ -205,16 +215,18 @@ where
     };
 
     let acceptor = TlsAcceptor::from(config);
-    let mut tls_stream = acceptor.accept(stream).await.unwrap();
+    let tls_stream = acceptor.accept(stream).await.unwrap();
 
-    tls_stream
-        .write_all(b"Hello from the server")
+    let io = TokioIo::new(tls_stream);
+    let host = Arc::new(host);
+    http1::Builder::new()
+        .serve_connection(
+            io,
+            service_fn(|req| tls_server_req(req, state.clone(), host.clone())),
+        )
         .await
         .unwrap();
-    tls_stream.flush().await.unwrap();
-    let mut buf = [0; 64];
-    let len = tls_stream.read(&mut buf).await.unwrap();
-    trace!("Received message from client: {:?}", &buf[..len]);
+
     Ok(())
 }
 
@@ -253,6 +265,46 @@ fn get_url_host(url: &Url) -> Result<&str, &'static str> {
         return Err("localhost not allowed");
     }
     return Ok(domain);
+}
+
+async fn tls_server_req(
+    req: Request<hyper::body::Incoming>,
+    state: Arc<Mutex<State>>,
+    host: Arc<String>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    dbg!(&req, &host);
+
+    let path = req.uri();
+    let url = Url::parse(&format!("https://{host}{path}")).unwrap();
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+    let body = req.collect().await.unwrap().to_bytes();
+
+    let client = {
+        let state = state.lock().unwrap();
+        state.client()
+    };
+    let request = client
+        .request(method, url)
+        .headers(headers)
+        .body(body)
+        .build()
+        .unwrap();
+
+    let res = client.execute(request).await.unwrap();
+    dbg!(&res);
+
+    let status = res.status();
+    let mut response = Response::builder().status(status);
+    let response_headers = response.headers_mut().unwrap();
+    for (header, value) in res.headers() {
+        response_headers.insert(header, value.clone());
+    }
+
+    let body = res.bytes().await.unwrap();
+    let response = response.body(Full::new(body)).unwrap();
+
+    Ok(response)
 }
 
 async fn http_proxy_conn_process(

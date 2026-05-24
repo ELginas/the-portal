@@ -1,13 +1,35 @@
+use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::SocketAddr;
+use std::net::ToSocketAddrs;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::Mutex;
 
+use http_body_util::BodyExt;
+use http_body_util::Empty;
+use http_body_util::Full;
+use http_body_util::combinators::BoxBody;
+use hyper::Method;
+use hyper::Request;
+use hyper::Response;
+use hyper::StatusCode;
+use hyper::body;
+use hyper::body::Bytes;
+use hyper::server::conn::http1;
+use hyper::server::conn::http2;
+use hyper::service::Service;
+use hyper::service::service_fn;
+use hyper::upgrade;
+use hyper_util::rt::TokioIo;
 use rcgen::string::Ia5String;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -16,6 +38,16 @@ use rcgen::{
 use rustls::pki_types::CertificateDer;
 use rustls::{ServerConfig, ServerConnection, Stream};
 use time::{Duration, OffsetDateTime};
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio_rustls::TlsAcceptor;
+use tracing::trace;
+use tracing_subscriber::{self, prelude::*};
+use url::Url;
 
 fn generate_ca() -> (CertificateDer<'static>, Issuer<'static, KeyPair>) {
     let mut params = CertificateParams::default();
@@ -116,43 +148,192 @@ fn load_cert() -> (CertificateDer<'static>, KeyPair) {
     (cert, key_pair)
 }
 
-fn main() {
-    // let (cert_ca, issuer) = generate_ca();
-    // save_ca(&cert_ca, &issuer);
-    let (cert_ca, issuer) = load_ca();
+struct State {
+    cert_ca: CertificateDer<'static>,
+    issuer: Issuer<'static, KeyPair>,
+    domain_configs: HashMap<String, Arc<ServerConfig>>,
+}
 
-    let (cert_domain, key_pair) = generate_cert(&issuer, "discordo.com");
-    save_cert(&cert_domain, &key_pair);
+impl State {
+    pub fn new() -> Self {
+        let (cert_ca, issuer) = load_ca();
 
-    // let (cert_domain, key_pair) = load_cert();
+        Self {
+            cert_ca,
+            issuer,
+            domain_configs: Default::default(),
+        }
+    }
 
-    let certs: Vec<CertificateDer<'static>> = vec![cert_domain, cert_ca];
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key_pair.into())
+    pub fn add_cert(&mut self, common_name: String) -> Arc<ServerConfig> {
+        let (cert_domain, key_pair) = generate_cert(&self.issuer, &common_name);
+        let certs: Vec<CertificateDer<'static>> = vec![cert_domain, self.cert_ca.clone()];
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key_pair.into())
+            .unwrap();
+        let config = Arc::new(config);
+
+        self.domain_configs.insert(common_name, config.clone());
+        config
+    }
+
+    pub fn get_cert<'a>(&self, common_name: &'a str) -> Option<Arc<ServerConfig>> {
+        self.domain_configs.get(common_name).map(|v| v.clone())
+    }
+}
+
+async fn tls_stream<IO>(
+    stream: IO,
+    state: Arc<Mutex<State>>,
+    uri: String,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    dbg!(&uri);
+    let uri = "https://".to_owned() + &uri;
+    let url = Url::parse(&uri).unwrap();
+
+    let host = get_url_host(&url).unwrap();
+    let config = {
+        let mut state = state.lock().unwrap();
+        match state.get_cert(&host) {
+            Some(v) => v,
+            None => state.add_cert(host.to_owned()),
+        }
+    };
+
+    let acceptor = TlsAcceptor::from(config);
+    let mut tls_stream = acceptor.accept(stream).await.unwrap();
+
+    tls_stream
+        .write_all(b"Hello from the server")
+        .await
         .unwrap();
-    let config = Arc::new(config);
+    tls_stream.flush().await.unwrap();
+    let mut buf = [0; 64];
+    let len = tls_stream.read(&mut buf).await.unwrap();
+    trace!("Received message from client: {:?}", &buf[..len]);
+    Ok(())
+}
+
+fn get_url_host(url: &Url) -> Result<&str, &'static str> {
+    if url.scheme() != "https" {
+        return Err("invalid scheme");
+    }
+    if url.username() != "" {
+        return Err("invalid username");
+    }
+    if url.password() != None {
+        return Err("invalid password");
+    }
+    let host = match url.host() {
+        Some(v) => v,
+        None => return Err("invalid host"),
+    };
+    let domain = match host {
+        url::Host::Domain(v) => v,
+        url::Host::Ipv4(_) => return Err("host IPv4 not allowed"),
+        url::Host::Ipv6(_) => return Err("host IPv6 not allowed"),
+    };
+    if url.port() != None {
+        return Err("invalid port");
+    }
+    if url.path() != "/" {
+        return Err("invalid path");
+    }
+    if url.query() != None {
+        return Err("invalid query");
+    }
+    if url.fragment() != None {
+        return Err("invalid fragment");
+    }
+    if domain == "localhost" {
+        return Err("localhost not allowed");
+    }
+    return Ok(domain);
+}
+
+async fn http_proxy_conn_process(
+    stream: TcpStream,
+    state: Arc<Mutex<State>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let io = TokioIo::new(stream);
+
+    http1::Builder::new()
+        .serve_connection(io, service_fn(|req| proxy(req, state.clone())))
+        .with_upgrades()
+        .await
+        .unwrap();
+
+    Ok(())
+}
+
+async fn proxy<'a>(
+    req: Request<hyper::body::Incoming>,
+    state: Arc<Mutex<State>>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    if req.method() != Method::CONNECT {
+        let mut resp = Response::new(Full::new(Bytes::from("Only HTTPS hosts supported")));
+        *resp.status_mut() = StatusCode::BAD_REQUEST;
+        return Ok(resp);
+    }
+
+    let uri = req.uri().authority().map(|v| v.to_string());
+    let uri = match uri {
+        Some(v) => v,
+        None => {
+            let mut resp = Response::new(Full::new(Bytes::from("No URI provided")));
+            *resp.status_mut() = StatusCode::BAD_REQUEST;
+            return Ok(resp);
+        }
+    };
+
+    tokio::spawn(async move {
+        let upgraded = upgrade::on(req).await.unwrap();
+        let upgraded = TokioIo::new(upgraded);
+        tls_stream(upgraded, state, uri).await.unwrap();
+    });
+
+    Ok(Response::new(empty()))
+}
+
+fn empty() -> Full<Bytes> {
+    Full::new(Bytes::new())
+}
+
+#[derive(Clone)]
+pub struct TokioExecutor;
+
+impl<F> hyper::rt::Executor<F> for TokioExecutor
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn execute(&self, fut: F) {
+        tokio::task::spawn(fut);
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .finish()
+        .init();
+
+    let state = Arc::new(Mutex::new(State::new()));
 
     let port = 4443;
-    let listener = TcpListener::bind(format!("[::]:{}", port)).unwrap();
+    let listener = TcpListener::bind(format!("[::]:{}", port)).await?;
 
     loop {
-        let l = || -> Result<(), Box<dyn std::error::Error>> {
-            let (mut tcp_stream, _) = listener.accept()?;
-            let mut conn = ServerConnection::new(config.clone())?;
-            let mut tls_stream = Stream::new(&mut conn, &mut tcp_stream);
+        let (stream, _) = listener.accept().await?;
 
-            tls_stream.write_all(b"Hello from the server")?;
-            tls_stream.flush()?;
-            let mut buf = [0; 64];
-            let len = tls_stream.read(&mut buf)?;
-            println!("Received message from client: {:?}", &buf[..len]);
-            Ok(())
-        };
-
-        match l() {
-            Ok(v) => (),
-            Err(e) => eprintln!("Error: {e}"),
-        }
+        let state = state.clone();
+        tokio::spawn(async {
+            http_proxy_conn_process(stream, state).await.unwrap();
+        });
     }
 }
